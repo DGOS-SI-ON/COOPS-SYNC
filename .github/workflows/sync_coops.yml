@@ -1,0 +1,36 @@
+name: Sync COOPS → Grist
+
+on:
+  # Lance automatiquement toutes les 30 minutes
+  schedule:
+    - cron: '*/30 * * * *'
+
+  # Bouton manuel dans GitHub → Actions → "Run workflow"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Installer les dépendances
+        run: pip install requests
+
+      - name: Lancer le sync COOPS → Grist
+        env:
+          DS_TOKEN:       ${{ secrets.DS_TOKEN }}
+          DEMARCHE_V1:    ${{ secrets.DEMARCHE_V1 }}
+          DEMARCHE_V2:    ${{ secrets.DEMARCHE_V2 }}
+          GRIST_API_KEY:  ${{ secrets.GRIST_API_KEY }}
+          GRIST_DOC_ID:   ${{ secrets.GRIST_DOC_ID }}
+          GRIST_BASE_URL: https://grist.numerique.gouv.fr/api
+          GRIST_TABLE:    EXPORT
+        run: python sync_direct.py
