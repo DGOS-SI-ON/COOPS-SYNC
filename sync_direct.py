@@ -215,10 +215,11 @@ def label_to_column(label: str) -> str:
 # FONCTIONS GRIST
 # =============================================================================
 
-def get_existing_dossier_numbers() -> dict[int, int]:
+def get_existing_dossier_numbers() -> dict[tuple, int]:
     """
-    Retourne un dict {dossier_number: grist_row_id} pour tous les enregistrements
-    déjà présents dans la table EXPORT. Utilisé pour l'upsert.
+    Retourne un dict {(dossier_number, source_version): grist_row_id} pour tous
+    les enregistrements déjà présents dans la table EXPORT.
+    La clé composite évite les collisions entre un dossier v1 et v2 de même numéro.
     """
     url = f"{GRIST_BASE_URL}/docs/{GRIST_DOC_ID}/tables/{TABLE_EXPORT}/records"
     r = requests.get(url, headers=GRIST_HEADERS, timeout=30)
@@ -229,9 +230,9 @@ def get_existing_dossier_numbers() -> dict[int, int]:
     r.raise_for_status()
     records = r.json().get("records", [])
     return {
-        rec["fields"].get("dossier_number"): rec["id"]
+        (rec["fields"].get("dossier_number"), rec["fields"].get("source_version")): rec["id"]
         for rec in records
-        if rec["fields"].get("dossier_number")
+        if rec["fields"].get("dossier_number") and rec["fields"].get("source_version")
     }
 
 
@@ -267,11 +268,12 @@ def ensure_table_exists():
         "tables": [{
             "id": TABLE_EXPORT,
             "columns": [
-                {"id": "dossier_number",  "fields": {"type": "Int",  "label": "N° Dossier"}},
-                {"id": "source_version",  "fields": {"type": "Text", "label": "Version"}},
-                {"id": "statut",          "fields": {"type": "Text", "label": "Statut"}},
-                {"id": "date_depot",      "fields": {"type": "Text", "label": "Date de dépôt"}},
-                {"id": "email_usager",    "fields": {"type": "Text", "label": "Email usager"}},
+                {"id": "dossier_id_source",  "fields": {"type": "Text", "label": "ID unique"}},
+                {"id": "dossier_number",     "fields": {"type": "Int",  "label": "N° Dossier"}},
+                {"id": "source_version",     "fields": {"type": "Text", "label": "Version"}},
+                {"id": "statut",             "fields": {"type": "Text", "label": "Statut"}},
+                {"id": "date_depot",         "fields": {"type": "Text", "label": "Date de dépôt"}},
+                {"id": "email_usager",       "fields": {"type": "Text", "label": "Email usager"}},
                 {"id": "groupe_instructeur", "fields": {"type": "Text", "label": "Groupe instructeur"}},
             ]
         }]
@@ -308,18 +310,24 @@ def ensure_columns_exist(all_rows: list[dict]):
 def upsert_to_grist(rows: list[dict], source_version: str, existing_map: dict):
     """
     Insère les nouveaux dossiers et met à jour les existants dans Grist.
-    Travaille par lots de 100 pour éviter les timeouts.
+    - Clé composite (dossier_number + source_version) pour éviter les doublons v1/v2
+    - Colonne dossier_id_source = numéro + suffixe c1 ou c2 pour identification rapide
+    - Travaille par lots de 100 pour éviter les timeouts.
     """
+    suffix = "c1" if source_version == "coops_v1" else "c2"
+
     to_create = []
     to_update = []
 
     for row in rows:
-        row["source_version"] = source_version
+        row["source_version"]  = source_version
+        row["dossier_id_source"] = f"{row.get('dossier_number')}_{suffix}"
         dossier_number = row.get("dossier_number")
+        key = (dossier_number, source_version)
 
-        if dossier_number in existing_map:
+        if key in existing_map:
             to_update.append({
-                "id": existing_map[dossier_number],
+                "id": existing_map[key],
                 "fields": row
             })
         else:
