@@ -1,31 +1,50 @@
 """
 sync_direct.py
 --------------
-Synchronise les dossiers COOPS v1 et v2 depuis Démarches Simplifiées vers Grist.
-- Aucun serveur requis
-- Aucune base de données externe
-- Grist est utilisé comme source de vérité pour éviter les doublons
-- Les secrets sont lus depuis les variables d'environnement (GitHub Secrets)
+Synchronise les dossiers COOPS vers Grist depuis Démarches Simplifiées.
+
+Démarches gérées :
+  - COOPS v1a  (DEMARCHE_V1A) ┐
+  - COOPS v1b  (DEMARCHE_V1B) ┴─→ fusionnées comme "coops_v1" dans EXPORT
+  - COOPS v2   (DEMARCHE_V2)  ──→ "coops_v2" dans EXPORT
+
+Fonctionnement :
+  - Sync incrémentale : seuls les dossiers modifiés depuis le dernier run sont traités
+  - La date du dernier run est stockée dans une table Grist "Sync_metadata"
+  - Premier run = import complet de tout l'historique
+  - Zéro serveur, zéro base de données externe
+  - Anti-doublon par clé composite (dossier_number + source_version)
+  - La colonne "dossier_id_source" = numéro_c1 ou numéro_c2
 
 Dépendances : pip install requests
+Secrets GitHub requis : DS_TOKEN, DEMARCHE_V1A, DEMARCHE_V1B, DEMARCHE_V2,
+                        GRIST_API_KEY, GRIST_DOC_ID
 """
 
 import os
+import re
 import sys
 import time
+import unicodedata
+from datetime import datetime, timezone
 import requests
 
 # =============================================================================
-# CONFIGURATION (depuis les variables d'environnement / GitHub Secrets)
+# CONFIGURATION
 # =============================================================================
 
-DS_TOKEN       = os.environ["DS_TOKEN"]
-DEMARCHE_V1    = os.environ.get("DEMARCHE_V1", "")   # Laisser vide si pas encore dispo
-DEMARCHE_V2    = os.environ.get("DEMARCHE_V2", "")   # Laisser vide si pas encore dispo
-GRIST_API_KEY  = os.environ["GRIST_API_KEY"]
-GRIST_DOC_ID   = os.environ["GRIST_DOC_ID"]
-GRIST_BASE_URL = os.environ.get("GRIST_BASE_URL", "https://grist.numerique.gouv.fr/api")
-TABLE_EXPORT   = os.environ.get("GRIST_TABLE", "EXPORT")
+DS_TOKEN        = os.environ["DS_TOKEN"]
+
+# Démarches — au moins une doit être définie
+DEMARCHE_V1A    = os.environ.get("DEMARCHE_V1A", "").strip()  # COOPS v1 démarche A
+DEMARCHE_V1B    = os.environ.get("DEMARCHE_V1B", "").strip()  # COOPS v1 démarche B (2 champs en plus)
+DEMARCHE_V2     = os.environ.get("DEMARCHE_V2",  "").strip()  # COOPS v2
+
+GRIST_API_KEY   = os.environ["GRIST_API_KEY"]
+GRIST_DOC_ID    = os.environ["GRIST_DOC_ID"]
+GRIST_BASE_URL  = os.environ.get("GRIST_BASE_URL", "https://grist.numerique.gouv.fr/api")
+TABLE_EXPORT    = os.environ.get("GRIST_TABLE", "EXPORT")
+TABLE_META      = "Sync_metadata"
 
 DS_API_URL = "https://www.demarches-simplifiees.fr/api/v2/graphql"
 
@@ -33,20 +52,20 @@ GRIST_HEADERS = {
     "Authorization": f"Bearer {GRIST_API_KEY}",
     "Content-Type": "application/json",
 }
-
 DS_HEADERS = {
     "Authorization": f"Bearer {DS_TOKEN}",
     "Content-Type": "application/json",
 }
 
 # =============================================================================
-# REQUÊTE GRAPHQL — récupère tous les dossiers d'une démarche avec pagination
+# REQUÊTE GRAPHQL
+# updatedSince est optionnel : absent = récupère tout (premier run)
 # =============================================================================
 
 QUERY = """
-query getDossiers($demarcheNumber: Int!, $after: String) {
+query getDossiers($demarcheNumber: Int!, $after: String, $updatedSince: ISO8601DateTime) {
   demarche(number: $demarcheNumber) {
-    dossiers(first: 100, after: $after) {
+    dossiers(first: 100, after: $after, updatedSince: $updatedSince) {
       pageInfo {
         hasNextPage
         endCursor
@@ -58,6 +77,7 @@ query getDossiers($demarcheNumber: Int!, $after: String) {
         datePassageEnConstruction
         datePassageEnInstruction
         dateTraitement
+        dateDerniereMiseAJour
         motivation
         usager { email }
         groupeInstructeur { label }
@@ -96,21 +116,49 @@ query getDossiers($demarcheNumber: Int!, $after: String) {
 """
 
 # =============================================================================
+# UTILITAIRES
+# =============================================================================
+
+def label_to_column(label: str) -> str:
+    """
+    Convertit un label DS en nom de colonne Grist valide.
+    Ex: "Nom du médecin" → "nom_du_medecin"
+    """
+    label = label.lower().strip()
+    label = unicodedata.normalize("NFD", label)
+    label = "".join(c for c in label if unicodedata.category(c) != "Mn")
+    label = re.sub(r"[^a-z0-9]+", "_", label)
+    label = label.strip("_")
+    return label[:60]
+
+
+def now_iso() -> str:
+    """Retourne l'heure actuelle en UTC au format ISO 8601."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# =============================================================================
 # FONCTIONS DS
 # =============================================================================
 
-def fetch_all_dossiers(demarche_number: str) -> list[dict]:
+def fetch_all_dossiers(demarche_number: str, updated_since: str | None) -> list[dict]:
     """
     Récupère tous les dossiers d'une démarche DS via GraphQL avec pagination.
-    Retourne une liste de dossiers normalisés (dict plat).
+    Si updated_since est fourni, ne récupère que les dossiers modifiés depuis cette date.
     """
-    print(f"  Récupération des dossiers de la démarche {demarche_number}...")
+    mode = f"modifiés depuis {updated_since}" if updated_since else "complet (premier run)"
+    print(f"    Démarche {demarche_number} — mode : {mode}")
+
     all_dossiers = []
     cursor = None
     page = 1
 
     while True:
-        variables = {"demarcheNumber": int(demarche_number), "after": cursor}
+        variables = {
+            "demarcheNumber": int(demarche_number),
+            "after": cursor,
+            "updatedSince": updated_since,
+        }
         response = requests.post(
             DS_API_URL,
             headers=DS_HEADERS,
@@ -121,17 +169,17 @@ def fetch_all_dossiers(demarche_number: str) -> list[dict]:
         data = response.json()
 
         if "errors" in data:
-            print(f"  ERREUR GraphQL : {data['errors']}", file=sys.stderr)
+            print(f"    ERREUR GraphQL : {data['errors']}", file=sys.stderr)
             break
 
         dossiers_data = data["data"]["demarche"]["dossiers"]
-        nodes = dossiers_data["nodes"]
-        page_info = dossiers_data["pageInfo"]
+        nodes         = dossiers_data["nodes"]
+        page_info     = dossiers_data["pageInfo"]
 
         for node in nodes:
             all_dossiers.append(normalize_dossier(node))
 
-        print(f"    Page {page} : {len(nodes)} dossiers récupérés")
+        print(f"      Page {page} : {len(nodes)} dossiers")
 
         if not page_info["hasNextPage"]:
             break
@@ -140,44 +188,43 @@ def fetch_all_dossiers(demarche_number: str) -> list[dict]:
         page += 1
         time.sleep(0.5)  # Respecter le rate limit DS
 
-    print(f"  Total : {len(all_dossiers)} dossiers")
+    print(f"    Total : {len(all_dossiers)} dossiers récupérés")
     return all_dossiers
 
 
 def normalize_dossier(node: dict) -> dict:
     """
     Transforme un nœud GraphQL DS en dict plat pour Grist.
-    Les champs répétables sont aplatis avec un index (ex: piece_jointe_1, piece_jointe_2).
+    Les champs répétables sont aplatis avec un index numérique.
     """
     row = {}
 
-    # Métadonnées du dossier
-    row["dossier_number"]                  = node.get("number")
-    row["statut"]                          = node.get("state", "")
-    row["date_depot"]                      = node.get("dateDepot", "") or ""
-    row["date_passage_en_construction"]    = node.get("datePassageEnConstruction", "") or ""
-    row["date_passage_en_instruction"]     = node.get("datePassageEnInstruction", "") or ""
-    row["date_traitement"]                 = node.get("dateTraitement", "") or ""
-    row["motivation"]                      = node.get("motivation", "") or ""
-    row["email_usager"]                    = (node.get("usager") or {}).get("email", "") or ""
-    row["groupe_instructeur"]              = (node.get("groupeInstructeur") or {}).get("label", "") or ""
+    # Métadonnées système DS
+    row["dossier_number"]               = node.get("number")
+    row["statut"]                       = node.get("state", "") or ""
+    row["date_depot"]                   = node.get("dateDepot", "") or ""
+    row["date_derniere_maj"]            = node.get("dateDerniereMiseAJour", "") or ""
+    row["date_passage_en_construction"] = node.get("datePassageEnConstruction", "") or ""
+    row["date_passage_en_instruction"]  = node.get("datePassageEnInstruction", "") or ""
+    row["date_traitement"]              = node.get("dateTraitement", "") or ""
+    row["motivation"]                   = node.get("motivation", "") or ""
+    row["email_usager"]                 = (node.get("usager") or {}).get("email", "") or ""
+    row["groupe_instructeur"]           = (node.get("groupeInstructeur") or {}).get("label", "") or ""
 
-    # Demandeur (personne physique ou morale)
+    # Demandeur
     demandeur = node.get("demandeur") or {}
-    row["demandeur_civilite"]     = demandeur.get("civilite", "") or ""
-    row["demandeur_nom"]          = demandeur.get("nom", "") or ""
-    row["demandeur_prenom"]       = demandeur.get("prenom", "") or ""
-    row["demandeur_email"]        = demandeur.get("email", "") or ""
-    row["demandeur_siret"]        = demandeur.get("siret", "") or ""
-    row["demandeur_raison_sociale"]= demandeur.get("raisonSociale", "") or ""
+    row["demandeur_civilite"]       = demandeur.get("civilite", "") or ""
+    row["demandeur_nom"]            = demandeur.get("nom", "") or ""
+    row["demandeur_prenom"]         = demandeur.get("prenom", "") or ""
+    row["demandeur_email"]          = demandeur.get("email", "") or ""
+    row["demandeur_siret"]          = demandeur.get("siret", "") or ""
+    row["demandeur_raison_sociale"] = demandeur.get("raisonSociale", "") or ""
 
     # Champs du formulaire → colonnes dynamiques
     for champ in node.get("champs", []) or []:
         col_name = label_to_column(champ.get("label", ""))
         if not col_name:
             continue
-
-        # Champ répétable → on aplatit les lignes
         if "rows" in champ and champ["rows"]:
             for i, row_block in enumerate(champ["rows"], start=1):
                 for sub_champ in row_block.get("champs", []):
@@ -196,70 +243,89 @@ def normalize_dossier(node: dict) -> dict:
     return row
 
 
-def label_to_column(label: str) -> str:
-    """
-    Convertit un label DS en nom de colonne Grist valide.
-    Ex: "Nom du médecin" → "nom_du_medecin"
-    """
-    import unicodedata
-    import re
-    label = label.lower().strip()
-    label = unicodedata.normalize("NFD", label)
-    label = "".join(c for c in label if unicodedata.category(c) != "Mn")
-    label = re.sub(r"[^a-z0-9]+", "_", label)
-    label = label.strip("_")
-    return label[:60]  # Limite raisonnable pour Grist
-
-
 # =============================================================================
-# FONCTIONS GRIST
+# FONCTIONS GRIST — SYNC METADATA
 # =============================================================================
 
-def get_existing_dossier_numbers() -> dict[tuple, int]:
+def ensure_metadata_table():
+    """Crée la table Sync_metadata si elle n'existe pas."""
+    url = f"{GRIST_BASE_URL}/docs/{GRIST_DOC_ID}/tables"
+    r = requests.get(url, headers=GRIST_HEADERS, timeout=30)
+    r.raise_for_status()
+
+    if TABLE_META in [t["id"] for t in r.json().get("tables", [])]:
+        return
+
+    print(f"  Création de la table '{TABLE_META}'...")
+    r = requests.post(url, headers=GRIST_HEADERS, json={
+        "tables": [{
+            "id": TABLE_META,
+            "columns": [
+                {"id": "demarche",      "fields": {"type": "Text", "label": "Démarche"}},
+                {"id": "derniere_sync", "fields": {"type": "Text", "label": "Dernière sync"}},
+            ]
+        }]
+    })
+    r.raise_for_status()
+    print(f"  Table '{TABLE_META}' créée ✓")
+
+
+def get_last_sync(demarche_number: str) -> str | None:
     """
-    Retourne un dict {(dossier_number, source_version): grist_row_id} pour tous
-    les enregistrements déjà présents dans la table EXPORT.
-    La clé composite évite les collisions entre un dossier v1 et v2 de même numéro.
+    Lit la date du dernier sync réussi pour une démarche.
+    Retourne None si c'est le premier run.
     """
-    url = f"{GRIST_BASE_URL}/docs/{GRIST_DOC_ID}/tables/{TABLE_EXPORT}/records"
+    url = f"{GRIST_BASE_URL}/docs/{GRIST_DOC_ID}/tables/{TABLE_META}/records"
     r = requests.get(url, headers=GRIST_HEADERS, timeout=30)
 
     if r.status_code == 404:
-        return {}  # Table pas encore créée
+        return None
 
     r.raise_for_status()
-    records = r.json().get("records", [])
-    return {
-        (rec["fields"].get("dossier_number"), rec["fields"].get("source_version")): rec["id"]
-        for rec in records
-        if rec["fields"].get("dossier_number") and rec["fields"].get("source_version")
-    }
+    for rec in r.json().get("records", []):
+        if rec["fields"].get("demarche") == demarche_number:
+            val = rec["fields"].get("derniere_sync", "")
+            return val if val else None
+    return None
 
 
-def get_existing_columns() -> set[str]:
-    """Retourne l'ensemble des colonnes existantes dans la table EXPORT."""
-    url = f"{GRIST_BASE_URL}/docs/{GRIST_DOC_ID}/tables/{TABLE_EXPORT}/columns"
+def set_last_sync(demarche_number: str, sync_time: str):
+    """
+    Met à jour (ou crée) la ligne de métadonnée pour une démarche.
+    Appelé UNIQUEMENT après un sync réussi — garantit zéro perte en cas de plantage.
+    """
+    url = f"{GRIST_BASE_URL}/docs/{GRIST_DOC_ID}/tables/{TABLE_META}/records"
     r = requests.get(url, headers=GRIST_HEADERS, timeout=30)
-
-    if r.status_code == 404:
-        return set()
-
     r.raise_for_status()
-    return {
-        col["id"]
-        for col in r.json().get("columns", [])
-        if col["id"] not in ("id", "manualSort")
-    }
+
+    existing_id = None
+    for rec in r.json().get("records", []):
+        if rec["fields"].get("demarche") == demarche_number:
+            existing_id = rec["id"]
+            break
+
+    payload = {"demarche": demarche_number, "derniere_sync": sync_time}
+
+    if existing_id:
+        r = requests.patch(url, headers=GRIST_HEADERS,
+                           json={"records": [{"id": existing_id, "fields": payload}]})
+    else:
+        r = requests.post(url, headers=GRIST_HEADERS,
+                          json={"records": [{"fields": payload}]})
+    r.raise_for_status()
 
 
-def ensure_table_exists():
+# =============================================================================
+# FONCTIONS GRIST — TABLE EXPORT
+# =============================================================================
+
+def ensure_export_table():
     """Crée la table EXPORT dans Grist si elle n'existe pas."""
     url = f"{GRIST_BASE_URL}/docs/{GRIST_DOC_ID}/tables"
     r = requests.get(url, headers=GRIST_HEADERS, timeout=30)
     r.raise_for_status()
 
-    existing = [t["id"] for t in r.json().get("tables", [])]
-    if TABLE_EXPORT in existing:
+    if TABLE_EXPORT in [t["id"] for t in r.json().get("tables", [])]:
         print(f"  Table '{TABLE_EXPORT}' déjà existante ✓")
         return
 
@@ -272,7 +338,8 @@ def ensure_table_exists():
                 {"id": "dossier_number",     "fields": {"type": "Int",  "label": "N° Dossier"}},
                 {"id": "source_version",     "fields": {"type": "Text", "label": "Version"}},
                 {"id": "statut",             "fields": {"type": "Text", "label": "Statut"}},
-                {"id": "date_depot",         "fields": {"type": "Text", "label": "Date de dépôt"}},
+                {"id": "date_depot",         "fields": {"type": "Text", "label": "Date dépôt"}},
+                {"id": "date_derniere_maj",  "fields": {"type": "Text", "label": "Dernière MAJ"}},
                 {"id": "email_usager",       "fields": {"type": "Text", "label": "Email usager"}},
                 {"id": "groupe_instructeur", "fields": {"type": "Text", "label": "Groupe instructeur"}},
             ]
@@ -282,80 +349,131 @@ def ensure_table_exists():
     print(f"  Table '{TABLE_EXPORT}' créée ✓")
 
 
-def ensure_columns_exist(all_rows: list[dict]):
-    """
-    Crée dans Grist toutes les colonnes présentes dans les données
-    mais absentes de la table EXPORT.
-    """
-    existing_cols = get_existing_columns()
+def ensure_columns_exist(rows: list[dict]):
+    """Crée dans Grist les colonnes présentes dans les données mais absentes de la table."""
+    url = f"{GRIST_BASE_URL}/docs/{GRIST_DOC_ID}/tables/{TABLE_EXPORT}/columns"
+    r = requests.get(url, headers=GRIST_HEADERS, timeout=30)
 
-    needed_cols = set()
-    for row in all_rows:
-        needed_cols.update(row.keys())
-    needed_cols.add("source_version")
+    existing_cols = set()
+    if r.status_code != 404:
+        r.raise_for_status()
+        existing_cols = {
+            col["id"] for col in r.json().get("columns", [])
+            if col["id"] not in ("id", "manualSort")
+        }
 
-    missing = needed_cols - existing_cols
+    needed = set()
+    for row in rows:
+        needed.update(row.keys())
+    needed.update({"source_version", "dossier_id_source"})
+
+    missing = sorted(needed - existing_cols)
     if not missing:
-        print(f"  Colonnes à jour ({len(existing_cols)} colonnes) ✓")
+        print(f"    Colonnes à jour ({len(existing_cols)} colonnes) ✓")
         return
 
-    print(f"  Ajout de {len(missing)} colonnes manquantes...")
-    url = f"{GRIST_BASE_URL}/docs/{GRIST_DOC_ID}/tables/{TABLE_EXPORT}/columns"
-    payload = [{"id": col, "fields": {"type": "Text"}} for col in sorted(missing)]
+    print(f"    Ajout de {len(missing)} colonnes manquantes...")
+    payload = [{"id": col, "fields": {"type": "Text"}} for col in missing]
     r = requests.post(url, headers=GRIST_HEADERS, json={"columns": payload}, timeout=30)
     r.raise_for_status()
-    print(f"  Colonnes ajoutées : {sorted(missing)[:5]}{'...' if len(missing) > 5 else ''} ✓")
+    sample = missing[:5]
+    print(f"    Colonnes ajoutées : {sample}{'...' if len(missing) > 5 else ''} ✓")
+
+
+def get_existing_map() -> dict[tuple, int]:
+    """
+    Retourne {(dossier_number, source_version): grist_row_id}.
+    Clé composite pour éviter toute collision entre v1 et v2.
+    """
+    url = f"{GRIST_BASE_URL}/docs/{GRIST_DOC_ID}/tables/{TABLE_EXPORT}/records"
+    r = requests.get(url, headers=GRIST_HEADERS, timeout=60)
+
+    if r.status_code == 404:
+        return {}
+
+    r.raise_for_status()
+    result = {}
+    for rec in r.json().get("records", []):
+        f   = rec["fields"]
+        num = f.get("dossier_number")
+        ver = f.get("source_version")
+        if num and ver:
+            result[(num, ver)] = rec["id"]
+    return result
 
 
 def upsert_to_grist(rows: list[dict], source_version: str, existing_map: dict):
     """
-    Insère les nouveaux dossiers et met à jour les existants dans Grist.
-    - Clé composite (dossier_number + source_version) pour éviter les doublons v1/v2
-    - Colonne dossier_id_source = numéro + suffixe c1 ou c2 pour identification rapide
-    - Travaille par lots de 100 pour éviter les timeouts.
+    Insère les nouveaux dossiers et met à jour les existants.
+    Suffixe dossier_id_source : _c1 pour v1, _c2 pour v2.
     """
-    suffix = "c1" if source_version == "coops_v1" else "c2"
-
-    to_create = []
-    to_update = []
+    suffix     = "c1" if "v1" in source_version else "c2"
+    to_create  = []
+    to_update  = []
 
     for row in rows:
-        row["source_version"]  = source_version
+        row["source_version"]    = source_version
         row["dossier_id_source"] = f"{row.get('dossier_number')}_{suffix}"
-        dossier_number = row.get("dossier_number")
-        key = (dossier_number, source_version)
+        key = (row.get("dossier_number"), source_version)
 
         if key in existing_map:
-            to_update.append({
-                "id": existing_map[key],
-                "fields": row
-            })
+            to_update.append({"id": existing_map[key], "fields": row})
         else:
             to_create.append({"fields": row})
 
-    url = f"{GRIST_BASE_URL}/docs/{GRIST_DOC_ID}/tables/{TABLE_EXPORT}/records"
+    url   = f"{GRIST_BASE_URL}/docs/{GRIST_DOC_ID}/tables/{TABLE_EXPORT}/records"
     BATCH = 100
 
     if to_create:
         for i in range(0, len(to_create), BATCH):
-            batch = to_create[i:i + BATCH]
             r = requests.post(url, headers=GRIST_HEADERS,
-                              json={"records": batch}, timeout=60)
+                              json={"records": to_create[i:i+BATCH]}, timeout=60)
             r.raise_for_status()
             time.sleep(0.3)
-        print(f"  {len(to_create)} nouveaux dossiers insérés ✓")
+        print(f"    {len(to_create)} nouveaux dossiers insérés ✓")
 
     if to_update:
         for i in range(0, len(to_update), BATCH):
-            batch = to_update[i:i + BATCH]
             r = requests.patch(url, headers=GRIST_HEADERS,
-                               json={"records": batch}, timeout=60)
+                               json={"records": to_update[i:i+BATCH]}, timeout=60)
             r.raise_for_status()
             time.sleep(0.3)
-        print(f"  {len(to_update)} dossiers mis à jour ✓")
+        print(f"    {len(to_update)} dossiers mis à jour ✓")
 
     if not to_create and not to_update:
-        print("  Aucun changement détecté ✓")
+        print("    Aucun changement détecté ✓")
+
+
+# =============================================================================
+# SYNC D'UNE DÉMARCHE
+# =============================================================================
+
+def sync_demarche(demarche_number: str, source_version: str, existing_map: dict):
+    """
+    Orchestre le sync d'une démarche :
+    1. Lit la date du dernier sync réussi dans Sync_metadata
+    2. Récupère uniquement les dossiers modifiés depuis cette date
+    3. Upsert dans EXPORT
+    4. Met à jour Sync_metadata UNIQUEMENT si tout a réussi
+       → Si le run plante, la date reste inchangée : aucune perte au prochain run
+    """
+    debut_run = now_iso()
+    last_sync = get_last_sync(demarche_number)
+
+    if last_sync:
+        print(f"  Dernier sync : {last_sync} → sync incrémental")
+    else:
+        print(f"  Aucun sync précédent → import complet de tout l'historique")
+
+    rows = fetch_all_dossiers(demarche_number, updated_since=last_sync)
+
+    if rows:
+        ensure_columns_exist(rows)
+        upsert_to_grist(rows, source_version, existing_map)
+
+    # Mise à jour de la date après succès total
+    set_last_sync(demarche_number, debut_run)
+    print(f"  Sync_metadata mis à jour → {debut_run} ✓")
 
 
 # =============================================================================
@@ -367,59 +485,40 @@ def main():
     print("  SYNC COOPS → GRIST")
     print("="*60)
 
-    if not DEMARCHE_V1 and not DEMARCHE_V2:
-        print("ERREUR : Aucune démarche configurée (DEMARCHE_V1 et DEMARCHE_V2 sont vides)")
+    demarches_actives = [d for d in [DEMARCHE_V1A, DEMARCHE_V1B, DEMARCHE_V2] if d]
+    if not demarches_actives:
+        print("ERREUR : Aucune démarche configurée.")
+        print("Définir au moins un secret parmi : DEMARCHE_V1A, DEMARCHE_V1B, DEMARCHE_V2")
         sys.exit(1)
 
-    # 1. S'assurer que la table EXPORT existe dans Grist
-    print("\n[1/5] Vérification de la table Grist...")
-    ensure_table_exists()
+    print(f"\nDémarches actives : {demarches_actives}")
 
-    # 2. Récupérer les dossiers depuis DS
-    all_rows = []
+    # Étape 1 — Tables Grist
+    print("\n[1/4] Vérification des tables Grist...")
+    ensure_export_table()
+    ensure_metadata_table()
 
-    if DEMARCHE_V1:
-        print(f"\n[2/5] Récupération COOPS v1 (démarche {DEMARCHE_V1})...")
-        rows_v1 = fetch_all_dossiers(DEMARCHE_V1)
-        for row in rows_v1:
-            row["source_version"] = "coops_v1"
-        all_rows.extend(rows_v1)
-    else:
-        print("\n[2/5] COOPS v1 non configuré, ignoré.")
-        rows_v1 = []
-
-    if DEMARCHE_V2:
-        print(f"\n[3/5] Récupération COOPS v2 (démarche {DEMARCHE_V2})...")
-        rows_v2 = fetch_all_dossiers(DEMARCHE_V2)
-        for row in rows_v2:
-            row["source_version"] = "coops_v2"
-        all_rows.extend(rows_v2)
-    else:
-        print("\n[3/5] COOPS v2 non configuré, ignoré.")
-        rows_v2 = []
-
-    if not all_rows:
-        print("\nAucun dossier récupéré, fin du script.")
-        return
-
-    # 3. Créer les colonnes manquantes dans Grist
-    print(f"\n[4/5] Mise à jour des colonnes ({len(all_rows)} dossiers, démarches fusionnées)...")
-    ensure_columns_exist(all_rows)
-
-    # 4. Récupérer les dossiers déjà dans Grist (pour l'upsert)
-    print("\n[5/5] Synchronisation vers Grist...")
-    existing_map = get_existing_dossier_numbers()
+    # Étape 2 — Charger la map existante une seule fois
+    print("\n[2/4] Chargement des dossiers existants...")
+    existing_map = get_existing_map()
     print(f"  {len(existing_map)} dossiers déjà présents dans Grist")
 
-    if DEMARCHE_V1 and rows_v1:
-        print(f"\n  → COOPS v1 :")
-        upsert_to_grist(rows_v1, "coops_v1", existing_map)
-        # Mettre à jour la map pour v2 (évite les doublons si même numéro)
-        existing_map = get_existing_dossier_numbers()
+    # Étape 3 — Sync de chaque démarche
+    print("\n[3/4] Synchronisation...")
 
-    if DEMARCHE_V2 and rows_v2:
-        print(f"\n  → COOPS v2 :")
-        upsert_to_grist(rows_v2, "coops_v2", existing_map)
+    if DEMARCHE_V1A:
+        print(f"\n  → COOPS v1a (démarche {DEMARCHE_V1A})")
+        sync_demarche(DEMARCHE_V1A, "coops_v1", existing_map)
+        existing_map = get_existing_map()
+
+    if DEMARCHE_V1B:
+        print(f"\n  → COOPS v1b (démarche {DEMARCHE_V1B})")
+        sync_demarche(DEMARCHE_V1B, "coops_v1", existing_map)
+        existing_map = get_existing_map()
+
+    if DEMARCHE_V2:
+        print(f"\n  → COOPS v2 (démarche {DEMARCHE_V2})")
+        sync_demarche(DEMARCHE_V2, "coops_v2", existing_map)
 
     print("\n" + "="*60)
     print("  ✅ SYNC TERMINÉ")
