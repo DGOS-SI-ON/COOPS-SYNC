@@ -90,7 +90,6 @@ query getDossiers($demarcheNumber: Int!, $after: String, $updatedSince: ISO8601D
           }
           ... on PersonneMorale {
             siret
-            entrepriseRaisonSociale
           }
         }
         champs {
@@ -218,7 +217,6 @@ def normalize_dossier(node: dict) -> dict:
     row["demandeur_prenom"]         = demandeur.get("prenom", "") or ""
     row["demandeur_email"]          = demandeur.get("email", "") or ""
     row["demandeur_siret"]          = demandeur.get("siret", "") or ""
-    row["demandeur_raison_sociale"] = demandeur.get("entrepriseRaisonSociale", "") or ""
 
     # Champs du formulaire → colonnes dynamiques
     for champ in node.get("champs", []) or []:
