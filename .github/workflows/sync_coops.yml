@@ -27,7 +27,8 @@ jobs:
       - name: Lancer le sync COOPS → Grist
         env:
           DS_TOKEN:       ${{ secrets.DS_TOKEN }}
-          DEMARCHE_V1:    ${{ secrets.DEMARCHE_V1 }}
+          DEMARCHE_V1A:   ${{ secrets.DEMARCHE_V1A }}
+          DEMARCHE_V1B:   ${{ secrets.DEMARCHE_V1B }}
           DEMARCHE_V2:    ${{ secrets.DEMARCHE_V2 }}
           GRIST_API_KEY:  ${{ secrets.GRIST_API_KEY }}
           GRIST_DOC_ID:   ${{ secrets.GRIST_DOC_ID }}
