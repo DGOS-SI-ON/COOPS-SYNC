@@ -77,7 +77,7 @@ query getDossiers($demarcheNumber: Int!, $after: String, $updatedSince: ISO8601D
         datePassageEnConstruction
         datePassageEnInstruction
         dateTraitement
-        dateDerniereMiseAJour
+        dateDerniereModification
         motivation
         usager { email }
         groupeInstructeur { label }
@@ -90,7 +90,7 @@ query getDossiers($demarcheNumber: Int!, $after: String, $updatedSince: ISO8601D
           }
           ... on PersonneMorale {
             siret
-            raisonSociale
+            entrepriseRaisonSociale
           }
         }
         champs {
@@ -203,7 +203,7 @@ def normalize_dossier(node: dict) -> dict:
     row["dossier_number"]               = node.get("number")
     row["statut"]                       = node.get("state", "") or ""
     row["date_depot"]                   = node.get("dateDepot", "") or ""
-    row["date_derniere_maj"]            = node.get("dateDerniereMiseAJour", "") or ""
+    row["date_derniere_maj"]            = node.get("dateDerniereModification", "") or ""
     row["date_passage_en_construction"] = node.get("datePassageEnConstruction", "") or ""
     row["date_passage_en_instruction"]  = node.get("datePassageEnInstruction", "") or ""
     row["date_traitement"]              = node.get("dateTraitement", "") or ""
@@ -218,7 +218,7 @@ def normalize_dossier(node: dict) -> dict:
     row["demandeur_prenom"]         = demandeur.get("prenom", "") or ""
     row["demandeur_email"]          = demandeur.get("email", "") or ""
     row["demandeur_siret"]          = demandeur.get("siret", "") or ""
-    row["demandeur_raison_sociale"] = demandeur.get("raisonSociale", "") or ""
+    row["demandeur_raison_sociale"] = demandeur.get("entrepriseRaisonSociale", "") or ""
 
     # Champs du formulaire → colonnes dynamiques
     for champ in node.get("champs", []) or []:
