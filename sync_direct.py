@@ -370,10 +370,17 @@ def ensure_columns_exist(rows: list[dict]):
         print(f"    Colonnes à jour ({len(existing_cols)} colonnes) ✓")
         return
 
-    print(f"    Ajout de {len(missing)} colonnes manquantes...")
+    print(f"    Ajout de {len(missing)} colonnes manquantes (par lots de 50)...")
     payload = [{"id": col, "fields": {"type": "Text"}} for col in missing]
-    r = requests.post(url, headers=GRIST_HEADERS, json={"columns": payload}, timeout=30)
-    r.raise_for_status()
+
+    BATCH = 50
+    for i in range(0, len(payload), BATCH):
+        batch = payload[i:i + BATCH]
+        r = requests.post(url, headers=GRIST_HEADERS, json={"columns": batch}, timeout=60)
+        r.raise_for_status()
+        print(f"      Lot {i//BATCH + 1}/{(len(payload)-1)//BATCH + 1} : {len(batch)} colonnes ajoutées")
+        time.sleep(0.5)
+
     sample = missing[:5]
     print(f"    Colonnes ajoutées : {sample}{'...' if len(missing) > 5 else ''} ✓")
 
